@@ -1,12 +1,15 @@
 #!/bin/bash
-# xcode-dd-sweep.sh — reclaim stale Xcode/agent DerivedData without touching live builds.
+# xcode-dd-sweep.sh — reclaim stale Xcode/agent build output without touching live builds.
 #
 # Dry-run by default. Pass --apply to delete.
 #   xcode-dd-sweep.sh                        # report only
 #   xcode-dd-sweep.sh --apply --hours 12     # delete dirs idle >12h
 #   xcode-dd-sweep.sh --apply --lsp-cap 30   # also sweep idle per-project LSP indexes
 #   xcode-dd-sweep.sh --apply --mcp          # also sweep idle XcodeBuildMCP workspaces
-#   xcode-dd-sweep.sh --apply --floor 40 --notify  # macOS alert when still under floor
+#   xcode-dd-sweep.sh --apply --repos ~/Documents   # also sweep git-ignored Xcode build
+#                                            #   dirs (build/, DerivedData/, dd-*) in checkouts
+#   xcode-dd-sweep.sh --apply --floor 40 --notify   # macOS alert when still under floor
+#   xcode-dd-sweep.sh --apply --floor 40 --only-when-low   # do nothing unless under floor
 #
 # Threshold is HOURS, not days: this workload creates 8-16G DerivedData dirs
 # several times a day, so a 2-day threshold never fires before the disk fills.
@@ -28,19 +31,22 @@ LSP_CAP=0                     # GiB; 0 disables LSP handling
 LSP_DIR="$HOME/.meesho-lsp-derivedData"
 MCP=0                         # 1 enables XcodeBuildMCP workspace sweeping
 MCP_DIR="$HOME/Library/Developer/XcodeBuildMCP/workspaces"
-XCTEST=0                     # 1 enables XCTest simulator-clone sweeping
+XCTEST=0                      # 1 enables XCTest simulator-clone sweeping
 XCTEST_DIR="$HOME/Library/Developer/XCTestDevices"
 SCRATCH_HOURS=0               # hours; 0 disables Claude session-scratch sweeping
 SCRATCH_ROOT="/private/tmp/claude-$(id -u)"
+REPO_ROOTS=()                 # --repos DIR (repeatable): scan git checkouts for build dirs
 FLOOR=0                       # GiB free below which pressure mode engages; 0 disables
 TARGET_MARGIN=15              # GiB of headroom pressure mode tries to restore
-NOTIFY=0                      # 1 raises a macOS notification on sustained low space
-NOTIFY_AFTER=2                # consecutive under-floor runs before the first alert
-NOTIFY_EVERY=8                # then re-alert every N runs (8 = daily at 3h cadence)
+ONLY_WHEN_LOW=0               # 1 = exit without doing anything unless free < FLOOR
+NOTIFY=0                      # 1 raises a macOS notification when a sweep can't restore the floor
+NOTIFY_GAP=21600              # seconds between repeat alerts while under the floor (6h)
+CRIT=10                       # GiB; below this, repeat alerts hourly instead
 APPLY=0
 QUIET=0
 LOG="$HOME/Library/Logs/xcode-dd-sweep.log"
-LOW_STATE="$HOME/Library/Logs/xcode-dd-sweep.lowcount"
+LOW_STATE="$HOME/Library/Logs/xcode-dd-sweep.lowcount"   # epoch of the last alert
+LOCK="$HOME/Library/Logs/xcode-dd-sweep.lock"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -52,16 +58,38 @@ while [ $# -gt 0 ]; do
     --mcp)      MCP=1; shift ;;
     --xctest)   XCTEST=1; shift ;;
     --scratch)  SCRATCH_HOURS="${2:?--scratch needs a value}"; shift 2 ;;
+    --repos)    REPO_ROOTS+=("${2:?--repos needs a directory}"); shift 2 ;;
     --floor)    FLOOR="${2:?--floor needs a value}"; shift 2 ;;
+    --only-when-low) ONLY_WHEN_LOW=1; shift ;;
     --notify)   NOTIFY=1; shift ;;
     --quiet)    QUIET=1; shift ;;
-    -h|--help)  sed -n '2,22p' "$0"; exit 0 ;;
+    -h|--help)  sed -n '2,24p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
 
 mkdir -p "$(dirname "$LOG")"
 say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG"; }
+free_kb()  { df -k /System/Volumes/Data | tail -1 | awk '{print $4}'; }
+free_gib() { echo $(( $(free_kb) / 1048576 )); }
+
+if [ "$ONLY_WHEN_LOW" -eq 1 ]; then
+  [ "$FLOOR" -gt 0 ] || { echo "--only-when-low needs --floor" >&2; exit 2; }
+  # The frequent low-space check: stay silent (no log line) while there's room.
+  [ "$(free_gib)" -lt "$FLOOR" ] || exit 0
+fi
+
+# One sweep at a time: the 15-minute low-space check and the 3-hourly run can
+# coincide, and a pressure sweep can take 15+ minutes. A lock older than 2h is
+# left over from a killed run.
+if ! mkdir "$LOCK" 2>/dev/null; then
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +120 2>/dev/null)" ]; then
+    rm -rf "$LOCK"; mkdir "$LOCK" 2>/dev/null || exit 0
+  else
+    exit 0
+  fi
+fi
+trap 'rmdir "$LOCK" 2>/dev/null' EXIT
 
 # Snapshot once, up front, excluding this shell and its children. Capturing this
 # per-directory would self-match: our own du/find/lsof carry the path in argv.
@@ -81,22 +109,40 @@ is_live() {
   return 1
 }
 
+# Pretty name for the log: repo/build and session/scratchpad/dd are ambiguous on
+# their own ("build" x3), so keep the parent for those.
+label() {
+  case "$1" in
+    */scratchpad/*|*/build|*/DerivedData|*/.derivedData) echo "$(basename "$(dirname "$1")")/$(basename "$1")" ;;
+    *) basename "$1" ;;
+  esac
+}
+
+remove_dir() {
+  local d="$1"
+  # XCTest clones are registered in the device set; let simctl drop the entry too.
+  if [ "$(dirname "$d")" = "$XCTEST_DIR" ]; then
+    xcrun simctl --set "$XCTEST_DIR" delete "$(basename "$d")" >/dev/null 2>&1 && return 0
+  fi
+  rm -rf "$d" 2>/dev/null
+}
+
 sweep() {
   local d="$1" reason kb human
   [ -d "$d" ] || return
   if reason=$(is_live "$d"); then
-    say "SKIP  $(basename "$d")  — $reason"; skip_count=$((skip_count+1)); return
+    say "SKIP  $(label "$d")  — $reason"; skip_count=$((skip_count+1)); return
   fi
   kb=$(du -sk "$d" 2>/dev/null | cut -f1); kb=${kb:-0}
   human=$(du -sh "$d" 2>/dev/null | cut -f1)
   if [ "$APPLY" -eq 1 ]; then
-    if rm -rf "$d" 2>/dev/null; then
-      say "DEL   $(basename "$d")  ($human)"; freed_kb=$((freed_kb+kb)); del_count=$((del_count+1))
+    if remove_dir "$d"; then
+      say "DEL   $(label "$d")  ($human)"; freed_kb=$((freed_kb+kb)); del_count=$((del_count+1))
     else
-      say "FAIL  $(basename "$d")  — became active during delete, left in place"; skip_count=$((skip_count+1))
+      say "FAIL  $(label "$d")  — became active during delete, left in place"; skip_count=$((skip_count+1))
     fi
   else
-    say "WOULD $(basename "$d")  ($human)"; freed_kb=$((freed_kb+kb)); del_count=$((del_count+1))
+    say "WOULD $(label "$d")  ($human)"; freed_kb=$((freed_kb+kb)); del_count=$((del_count+1))
   fi
 }
 
@@ -104,8 +150,48 @@ sweep() {
 # rewritten in place, so their top-level mtime stays old while files inside churn.
 stale() { [ -z "$(find "$1" -type f -mmin "-$2" -print -quit 2>/dev/null)" ]; }
 
+# An Xcode derived-data tree, whatever it is named: xcodebuild -derivedDataPath X
+# always creates X/Build or X/Index.noindex. Checking the shape (not the name)
+# keeps us off unrelated build/ dirs (Gradle, JS bundles, ...).
+is_xcode_dd() { [ -d "$1/Build/Products" ] || [ -d "$1/Build/Intermediates.noindex" ] || [ -d "$1/Index.noindex" ]; }
+
+# Build dirs inside git checkouts (xcodebuild -derivedDataPath build). Three of these
+# reached 56G unnoticed because nothing looked in ~/Documents. Only top-level dirs of
+# a checkout, only if git ignores them and tracks nothing inside, only Xcode-shaped.
+repo_build_dirs() {
+  local root repo d name
+  for root in ${REPO_ROOTS[@]+"${REPO_ROOTS[@]}"}; do
+    [ -d "$root" ] || continue
+    while IFS= read -r g; do
+      repo=$(dirname "$g")
+      for d in "$repo"/*/ "$repo"/.derivedData/; do
+        d=${d%/}; [ -d "$d" ] || continue
+        name=$(basename "$d")
+        case "$name" in
+          build|Build|DerivedData|derivedData|.derivedData|dd|dd-*|*-dd|*-derived-data|*-DerivedData) ;;
+          *) continue ;;
+        esac
+        is_xcode_dd "$d" || continue
+        git -C "$repo" check-ignore -q "$name" 2>/dev/null || continue
+        [ -z "$(git -C "$repo" ls-files -- "$name" 2>/dev/null | head -1)" ] || continue
+        printf '%s\n' "$d"
+      done
+    done < <(find "$root" -maxdepth 3 -name .git -prune -print 2>/dev/null)
+  done
+}
+
+# Build dirs inside Claude Code session scratchpads. A session that stays open for
+# days keeps its scratch "live" as a whole, while a 7G dd-* build inside it sits idle.
+scratch_build_dirs() {
+  [ -d "$SCRATCH_ROOT" ] || return
+  while IFS= read -r d; do
+    is_xcode_dd "$d" && printf '%s\n' "$d"
+  done < <(find "$SCRATCH_ROOT" -mindepth 4 -maxdepth 4 -type d -path '*/scratchpad/*' 2>/dev/null)
+}
+
 MINS=$((HOURS*60))
-say "=== sweep start (mode=$([ $APPLY -eq 1 ] && echo apply || echo dry-run), idle>${HOURS}h, grace=${GRACE}m, lsp-cap=${LSP_CAP}GiB, mcp=${MCP}, xctest=${XCTEST}, scratch=${SCRATCH_HOURS}h, floor=${FLOOR}GiB) ==="
+start_kb=$(free_kb)
+say "=== sweep start (mode=$([ $APPLY -eq 1 ] && echo apply || echo dry-run)$([ $ONLY_WHEN_LOW -eq 1 ] && echo ',only-when-low'), idle>${HOURS}h, grace=${GRACE}m, lsp-cap=${LSP_CAP}GiB, mcp=${MCP}, xctest=${XCTEST}, scratch=${SCRATCH_HOURS}h, repos=${#REPO_ROOTS[@]}, floor=${FLOOR}GiB) ==="
 say "free before: $(df -h /System/Volumes/Data | tail -1 | awk '{print $4}')"
 
 DD="$HOME/Library/Developer/Xcode/DerivedData"
@@ -120,12 +206,13 @@ fi
 
 # Per-task DerivedData from agent runs. Both suffix (foo-dd) and prefix (dd-foo)
 # naming appear in practice, plus assorted -derived-data spellings.
-while IFS= read -r d; do sweep "$d"; done < <(
-  find /private/tmp -mindepth 1 -maxdepth 1 -type d -mmin "+$MINS" \
+tmp_dd_dirs() {
+  find /private/tmp -mindepth 1 -maxdepth 1 -type d \
     \( -name '*-dd' -o -name 'dd-*' -o -name '*-derived-data' \
        -o -name '*-derivedData' -o -name '*derived-data*' \
-       -o -name 'DerivedData-*' -o -name '*-DerivedData' \) 2>/dev/null
-)
+       -o -name 'DerivedData-*' -o -name '*-DerivedData' \) "$@" 2>/dev/null
+}
+while IFS= read -r d; do sweep "$d"; done < <(tmp_dd_dirs -mmin "+$MINS")
 
 # LSP index: one subdir per project (8-20G each). Treating the whole dir as one unit
 # never fired -- the active project kept it live while an idle 20G sibling sat there.
@@ -155,22 +242,32 @@ if [ "$MCP" -eq 1 ] && [ -d "$MCP_DIR" ]; then
   done < <(find "$MCP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null)
 fi
 
+# Xcode build dirs inside git checkouts, idle past HOURS.
+while IFS= read -r d; do
+  stale "$d" "$MINS" && sweep "$d"
+done < <(repo_build_dirs)
+
 # XCTest simulator clones. XCTest spawns a fresh clone per test run and never
 # reaps them; seven had accumulated to a nominal 28G. They are APFS clones of the
-# base runtime, so du overstates the real reclaim. Only sweep when nothing is
-# testing: a clone deleted under a live run takes the run down with it.
+# base runtime, so du overstates the real reclaim. A clone deleted under a live
+# run takes the run down with it, so skip everything while a test is running.
+# Otherwise skip only clones that are themselves booted -- the old rule ("any
+# simulator booted anywhere") was nearly always true and let 27G pile up.
 # Match on comm= anchored to the binary name, NOT a substring of the full command:
 # 'xcodebuildmcp' (an always-running MCP server) contains 'xcodebuild', and a
-# substring match on it kept this guard permanently tripped -- it skipped every
-# run for a full day without ever sweeping a single clone.
+# substring match on it kept this guard permanently tripped.
 if [ "$XCTEST" -eq 1 ] && [ -d "$XCTEST_DIR" ]; then
-  if xcrun simctl list devices booted 2>/dev/null | grep -qi booted; then
-    say "XCTestDevices: simulator booted — skipping all clones"
-  elif ps -Ao comm= | grep -Eiq '(^|/)(xcodebuild|xctest)$'; then
+  if ps -Ao comm= | grep -Eiq '(^|/)(xcodebuild|xctest)$'; then
     say "XCTestDevices: test run in progress — skipping all clones"
   else
-    while IFS= read -r d; do sweep "$d"; done < <(
-      find "$XCTEST_DIR" -mindepth 1 -maxdepth 1 -type d -mmin "+$MINS" 2>/dev/null)
+    booted=$(xcrun simctl --set "$XCTEST_DIR" list devices booted 2>/dev/null \
+               | grep -Eo '[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}')
+    while IFS= read -r d; do
+      if [ -n "$booted" ] && printf '%s\n' "$booted" | grep -Fqx "$(basename "$d")"; then
+        say "SKIP  $(basename "$d")  — clone is booted"; skip_count=$((skip_count+1)); continue
+      fi
+      sweep "$d"
+    done < <(find "$XCTEST_DIR" -mindepth 1 -maxdepth 1 -type d -mmin "+$MINS" 2>/dev/null)
   fi
 fi
 
@@ -182,6 +279,10 @@ if [ "$SCRATCH_HOURS" -gt 0 ] && [ -d "$SCRATCH_ROOT" ]; then
     case "$(basename "$d")" in "${CLAUDE_SESSION_ID:-__none__}") continue ;; esac
     sweep "$d"
   done < <(find "$SCRATCH_ROOT" -mindepth 2 -maxdepth 2 -type d -mmin "+$((SCRATCH_HOURS*60))" 2>/dev/null)
+  # Build dirs inside sessions that are still open: same idle rule as DerivedData.
+  while IFS= read -r d; do
+    stale "$d" "$MINS" && sweep "$d"
+  done < <(scratch_build_dirs)
 fi
 
 # Pressure mode. The age threshold alone cannot keep up with this workload: it
@@ -189,12 +290,21 @@ fi
 # dirs that are idle but only 2-3h old are what actually fill the disk. When free
 # space falls under the floor, sweep idle dirs oldest-first -- ignoring the age
 # threshold but enforcing every liveness guard unchanged -- until headroom returns.
-free_gib() { echo $(( $(df -k /System/Volumes/Data | tail -1 | awk '{print $4}') / 1048576 )); }
-pressure_roots=()
-[ -d "$DD" ] && pressure_roots+=("$DD")
-[ "$LSP_CAP" -gt 0 ] && [ -d "$LSP_DIR" ] && pressure_roots+=("$LSP_DIR")
-[ "$MCP" -eq 1 ] && [ -d "$MCP_DIR" ] && pressure_roots+=("$MCP_DIR")
-if [ "$FLOOR" -gt 0 ] && [ "$(free_gib)" -lt "$FLOOR" ] && [ "${#pressure_roots[@]}" -gt 0 ]; then
+# Candidates span every build-output location above, not just DerivedData: on
+# Nov 24 pressure mode ran out of DerivedData at 18G free while 70G of idle
+# build dirs sat in checkouts and open Claude sessions.
+pressure_candidates() {
+  local roots=()
+  [ -d "$DD" ] && roots+=("$DD")
+  [ "$LSP_CAP" -gt 0 ] && [ -d "$LSP_DIR" ] && roots+=("$LSP_DIR")
+  [ "$MCP" -eq 1 ] && [ -d "$MCP_DIR" ] && roots+=("$MCP_DIR")
+  [ "${#roots[@]}" -gt 0 ] && find "${roots[@]}" -mindepth 1 -maxdepth 1 -type d -mmin "+$GRACE" 2>/dev/null
+  tmp_dd_dirs -mmin "+$GRACE"
+  repo_build_dirs
+  [ "$SCRATCH_HOURS" -gt 0 ] && scratch_build_dirs
+  return 0
+}
+if [ "$FLOOR" -gt 0 ] && [ "$(free_gib)" -lt "$FLOOR" ]; then
   target=$((FLOOR + TARGET_MARGIN))
   say "PRESSURE: $(free_gib)GiB free < floor ${FLOOR}GiB — sweeping idle dirs oldest-first toward ${target}GiB"
   while IFS= read -r line; do
@@ -202,8 +312,7 @@ if [ "$FLOOR" -gt 0 ] && [ "$(free_gib)" -lt "$FLOOR" ] && [ "${#pressure_roots[
     [ "$(free_gib)" -ge "$target" ] && { say "PRESSURE: reached $(free_gib)GiB — stopping"; break; }
     case "$(basename "$d")" in Unsaved_Xcode_Document_*|*.noindex) continue ;; esac
     sweep "$d"
-  done < <(find "${pressure_roots[@]}" -mindepth 1 -maxdepth 1 -type d -mmin "+$GRACE" \
-             -exec stat -f '%m %N' {} + 2>/dev/null | sort -n)
+  done < <(pressure_candidates | while IFS= read -r p; do [ -d "$p" ] && stat -f '%m %N' "$p"; done | sort -n)
   say "PRESSURE: ended at $(free_gib)GiB free"
 fi
 
@@ -213,24 +322,27 @@ if [ "$APPLY" -eq 1 ]; then
 else
   say "would delete $del_count dirs, reclaiming ~$((freed_kb/1048576))Gi, skipping $skip_count as live"
 fi
+# du double-counts APFS clones and rounds per run; this is what the disk actually gained
+# (anything else writing during the run counts against it).
+say "free change: $(( ($(free_kb) - start_kb) / 1024 ))Mi"
 say "free after:  $(df -h /System/Volumes/Data | tail -1 | awk '{print $4}')"
 
-# Sustained-low alert. Early Oct ran under the floor for ~3 weeks -- pressure mode on
-# nearly every run, reclaiming almost nothing because the big dirs were held open --
-# and the first sign was 133MB free. Alert on the 2nd consecutive under-floor run,
-# then daily while it persists; reset once a run ends above the floor.
+# Low-space alert. Fires as soon as a sweep ends still under the floor (it has done
+# all it safely can, so a human is needed), then every 6h while it persists --
+# hourly once under CRIT GiB. Nov 24 went from 20G to 119M between two runs.
 if [ "$NOTIFY" -eq 1 ] && [ "$APPLY" -eq 1 ] && [ "$FLOOR" -gt 0 ]; then
-  low=$(cat "$LOW_STATE" 2>/dev/null); case "$low" in ''|*[!0-9]*) low=0 ;; esac
   if [ "$(free_gib)" -lt "$FLOOR" ]; then
-    low=$((low+1))
-    if [ "$low" -eq "$NOTIFY_AFTER" ] || { [ "$low" -gt "$NOTIFY_AFTER" ] && [ $(( (low-NOTIFY_AFTER) % NOTIFY_EVERY )) -eq 0 ]; }; then
-      msg="$(free_gib) GiB free (floor ${FLOOR}) for ${low} runs. Last sweep freed ~$((freed_kb/1048576)) GiB; ${skip_count} dirs skipped as in use."
+    now=$(date +%s)
+    last=$(cat "$LOW_STATE" 2>/dev/null); case "$last" in ''|*[!0-9]*) last=0 ;; esac
+    gap=$NOTIFY_GAP; [ "$(free_gib)" -lt "$CRIT" ] && gap=3600
+    if [ $((now - last)) -ge "$gap" ]; then
+      msg="$(free_gib) GiB free (floor ${FLOOR}). Sweep freed ~$((freed_kb/1048576)) GiB; ${skip_count} dirs in use. Quit idle Xcode/Claude sessions or simulators."
       osascript -e "display notification \"$msg\" with title \"Disk space low\" subtitle \"xcode-dd-sweep\" sound name \"Basso\"" >/dev/null 2>&1
       say "NOTIFY: $msg"
+      printf '%s\n' "$now" > "$LOW_STATE"
     fi
   else
-    low=0
+    rm -f "$LOW_STATE"
   fi
-  printf '%s\n' "$low" > "$LOW_STATE"
 fi
 say "=== sweep end ==="
