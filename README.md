@@ -9,14 +9,24 @@ Keeps an iOS dev Mac from filling up with Xcode / agent build output. Runs every
 | Agent build dirs | `/private/tmp/*-dd`, `*derived-data*`, … | idle > 12h |
 | XcodeBuildMCP workspaces | `~/Library/Developer/XcodeBuildMCP/workspaces/*` | idle > 12h |
 | LSP index (per project) | `~/.meesho-lsp-derivedData/*` | idle > 12h, or total > 30 GiB |
-| XCTest simulator clones | `~/Library/Developer/XCTestDevices/*` | idle > 12h, no simulator booted |
+| Xcode build dirs in your checkouts | `build/`, `DerivedData/`, `dd-*` at the top of a git checkout | idle > 12h, git-ignored, nothing tracked inside, Xcode-shaped |
+| XCTest simulator clones | `~/Library/Developer/XCTestDevices/*` | idle > 12h, clone not booted, no test running |
 | Claude Code session scratch | `/private/tmp/claude-<uid>/*/*` | idle > 48h |
+| Build dirs inside open Claude sessions | `…/scratchpad/<dir>` that looks like DerivedData | idle > 12h |
+
+Checkouts are found up to two levels below `~/Documents`, `~/Developer`, `~/Projects`,
+`~/code` and `~/work` (whichever exist; change with `--repos DIR` / `--no-repos`).
+A `build/` dir is only touched if it has Xcode's layout (`Build/Products`,
+`Build/Intermediates.noindex` or `Index.noindex`), so Gradle/JS `build/` dirs are left alone.
 
 **Low-space mode:** when free space drops under 40 GiB it also sweeps dirs idle
-for just 30 min, oldest first, until ~55 GiB is free.
+for just 30 min, oldest first, from every location above, until ~55 GiB is free.
+A second job checks free space **every 15 minutes** and runs this sweep only when
+you're under the floor, so a burst of builds between the 3-hourly runs is caught
+within minutes. Above the floor that check does nothing and logs nothing.
 
-**Alerts:** a macOS notification if free space stays under the floor for two runs
-in a row (then daily), so you hear about it before the disk is full.
+**Alerts:** a macOS notification as soon as a sweep can't get you back above the
+floor (everything left is in use), then every 6h while it lasts — hourly under 10 GiB.
 
 ## Never deletes anything in use
 
@@ -42,6 +52,10 @@ Options:
 
 ```bash
 ./install.sh --report-only   # cautious start: only logs what it WOULD delete
+./install.sh --only-when-low # never clean on a schedule; only when free space < floor
+                             # (keeps your DerivedData/indexes warm until space is short)
+./install.sh --repos ~/src   # your checkouts live elsewhere (repeatable)
+./install.sh --no-repos      # don't look inside checkouts
 ./install.sh --floor 25      # 256 GB Mac? lower the low-space floor
 ./install.sh --hours 24      # keep idle builds longer
 ./install.sh --no-notify     # no alerts
@@ -56,6 +70,8 @@ Re-run `./install.sh` after `git pull` to upgrade.
 tail -30 ~/Library/Logs/xcode-dd-sweep.log         # DEL / SKIP lines per run
 xcode-dd-sweep                                     # dry run right now (if ~/.local/bin is on PATH)
 launchctl print gui/$(id -u)/com.meesho.xcode-dd-sweep | grep -E 'runs|last exit'
+launchctl print gui/$(id -u)/com.meesho.xcode-dd-sweep.low | grep -E 'runs|last exit'
+grep 'free change' ~/Library/Logs/xcode-dd-sweep.log | tail   # real space gained per run
 ```
 
 If runs keep logging `PRESSURE` with `skipped N as live` and little reclaimed,
